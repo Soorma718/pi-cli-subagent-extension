@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import registerCliSubagent from "./index";
+import registerCliSubagent, { parseHandoffTimeoutMs } from "./index";
 
 const tempDirs: string[] = [];
 const originalCmuxEnv = {
@@ -81,6 +81,21 @@ function extractLauncherPath(command: string): string {
   if (!match) throw new Error(`Could not extract launcher path from: ${command}`);
   return match[1];
 }
+
+describe("parseHandoffTimeoutMs", () => {
+  it("treats unset and disabled values as unlimited wait", () => {
+    expect(parseHandoffTimeoutMs(undefined)).toBeNull();
+    expect(parseHandoffTimeoutMs("")).toBeNull();
+    expect(parseHandoffTimeoutMs("0")).toBeNull();
+    expect(parseHandoffTimeoutMs("off")).toBeNull();
+    expect(parseHandoffTimeoutMs("false")).toBeNull();
+  });
+
+  it("accepts positive millisecond values when explicitly configured", () => {
+    expect(parseHandoffTimeoutMs("1800")).toBe(1800);
+    expect(parseHandoffTimeoutMs("60000")).toBe(60000);
+  });
+});
 
 describe("cli_subagent tool", () => {
   it("fails fast for an invalid working directory before launching cmux", async () => {

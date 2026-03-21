@@ -55,8 +55,20 @@ function coerceBoolean(value: string | undefined, fallback: boolean): boolean {
   return fallback;
 }
 
+export function parseHandoffTimeoutMs(value: string | undefined): number | null {
+  if (value === undefined) return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || ["0", "false", "no", "off", "none", "unlimited", "infinite"].includes(normalized)) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
 const DEFAULT_MAX_CONCURRENCY = coercePositiveInt(process.env.PI_CLI_SUBAGENT_MAX_CONCURRENCY, 2);
-const HANDOFF_TIMEOUT_MS = coercePositiveInt(process.env.PI_CLI_SUBAGENT_MAX_WAIT_MS, 30 * 60 * 1000);
+const HANDOFF_TIMEOUT_MS = parseHandoffTimeoutMs(process.env.PI_CLI_SUBAGENT_MAX_WAIT_MS);
 const INCLUDE_DEBUG_PATHS = coerceBoolean(process.env.PI_CLI_SUBAGENT_INCLUDE_DEBUG_PATHS, false);
 
 const CliSubagentTaskSchema = Type.Object({
@@ -808,7 +820,7 @@ async function runDelegatedTask(input: {
       }
 
       const elapsedMs = Date.now() - startedAt;
-      if (elapsedMs >= HANDOFF_TIMEOUT_MS) {
+      if (HANDOFF_TIMEOUT_MS !== null && elapsedMs >= HANDOFF_TIMEOUT_MS) {
         return finalizeTerminalError(
           "handoff_timeout",
           `Timed out waiting for ${profile.runtime} handoff after ${Math.round(HANDOFF_TIMEOUT_MS / 1000)}s.`,

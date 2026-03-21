@@ -8,7 +8,7 @@ Launch Codex or Gemini inside `cmux`, keep the delegated session visible and ste
 - falls back to a new `cmux` workspace when same-workspace launch context is unavailable
 - injects a manager-mode prompt that tells the delegated runtime to read first, plan briefly, break the work down, use native helper agents when useful, and hand back through `subagent_done`
 - switches to a review-only loop when the delegated task explicitly forbids edits
-- treats missing handoff as an explicit error instead of waiting forever
+- treats missing handoff as an explicit error once the delegated runtime exits instead of inventing completion
 - supports bounded parallel delegated runs through a `tasks` array
 - closes successful sessions by default and closes failed/timed-out sessions by default unless `retainOnError: true`
 - keeps local path details out of returned metadata by default; opt in with `PI_CLI_SUBAGENT_INCLUDE_DEBUG_PATHS=1`
@@ -60,7 +60,7 @@ cli_subagent({
 - no explicit handoff: returns an error payload once the delegated runtime exits without producing one
 - invalid result payload: fails loudly and closes by default instead of silently retrying bad JSON
 - invalid `cwd`: fails before spawning `cmux`
-- timeout: returns an error payload after `PI_CLI_SUBAGENT_MAX_WAIT_MS` and closes by default unless `retainOnError: true`
+- timeout: only applies when `PI_CLI_SUBAGENT_MAX_WAIT_MS` is set to a positive millisecond value; otherwise wait is unlimited
 - abort while waiting: returns an error payload and closes by default unless `retainOnError: true`
 
 ## Required local dependencies
@@ -72,7 +72,7 @@ This is an interactive local-tool workflow. There is no headless fallback if `cm
 
 ## Configuration
 Optional environment variables:
-- `PI_CLI_SUBAGENT_MAX_WAIT_MS`
+- `PI_CLI_SUBAGENT_MAX_WAIT_MS` — positive integer milliseconds to enable a timeout. unset/empty/`0`/`off`/`false` means unlimited wait (default)
 - `PI_CLI_SUBAGENT_MAX_CONCURRENCY`
 - `PI_CLI_SUBAGENT_INCLUDE_DEBUG_PATHS=1` to include local file paths in returned metadata
 - `PI_CLI_SUBAGENT_RUN_ROOT`
