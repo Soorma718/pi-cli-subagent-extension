@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+status="success"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --status)
+      if [[ $# -lt 2 ]]; then
+        echo "subagent_done: --status requires a value" >&2
+        exit 2
+      fi
+      status="$2"
+      shift 2
+      ;;
+    *)
+      echo "subagent_done: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$status" != "success" && "$status" != "error" ]]; then
+  echo "subagent_done: unsupported status '$status' (use success or error)" >&2
+  exit 2
+fi
+
+required_vars=(CLI_SUBAGENT_HANDOFF_FILE CLI_SUBAGENT_RESULT_FILE CLI_SUBAGENT_LAUNCHER_PID)
+for name in "${required_vars[@]}"; do
+  if [[ -z "${!name:-}" ]]; then
+    echo "subagent_done: missing required environment variable: $name" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -f "$CLI_SUBAGENT_HANDOFF_FILE" ]]; then
+  echo "subagent_done: handoff file does not exist: $CLI_SUBAGENT_HANDOFF_FILE" >&2
+  exit 1
+fi
+
+notes=$(cat "$CLI_SUBAGENT_HANDOFF_FILE")
+if [[ -z "${notes//[[:space:]]/}" ]]; then
+  echo "subagent_done: handoff notes are empty. write notes to $CLI_SUBAGENT_HANDOFF_FILE first." >&2
+  exit 1
+fi
+
+tmp_file="${CLI_SUBAGENT_RESULT_FILE}.tmp.$$"
+export CLI_SUBAGENT_STATUS="$status"
+python3 - "$tmp_file" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+tmp_path = pathlib.Path(sys.argv[1])
+notes_path = pathlib.Path(os.environ["CLI_SUBAGENT_HANDOFF_FILE"])
+notes = notes_path.read_text(encoding="utf-8")
+payload = {
+    "status": os.environ["CLI_SUBAGENT_STATUS"],
+    "notes": notes,
+    "handoffFile": os.environ["CLI_SUBAGENT_HANDOFF_FILE"],
+    "resultFile": os.environ["CLI_SUBAGENT_RESULT_FILE"],
+    "runtime": os.environ.get("CLI_SUBAGENT_RUNTIME"),
+    "profile": os.environ.get("CLI_SUBAGENT_PROFILE"),
+    "workspaceTitle": os.environ.get("CLI_SUBAGENT_WORKSPACE_TITLE"),
+    "transcriptFile": os.environ.get("CLI_SUBAGENT_TRANSCRIPT_FILE"),
+    "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+}
+tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+mv "$tmp_file" "$CLI_SUBAGENT_RESULT_FILE"
+
+echo "[cli_subagent] handoff recorded at $CLI_SUBAGENT_RESULT_FILE"
+child_pids=$(pgrep -P "$CLI_SUBAGENT_LAUNCHER_PID" || true)
+if [[ -n "${child_pids//[[:space:]]/}" ]]; then
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done <<< "$child_pids"
+else
+  kill -TERM "$CLI_SUBAGENT_LAUNCHER_PID" 2>/dev/null || true
+fi
