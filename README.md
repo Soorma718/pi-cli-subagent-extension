@@ -10,6 +10,8 @@ Launch Codex or Gemini inside `cmux`, keep the delegated session visible and ste
 - switches to a review-only loop when the delegated task explicitly forbids edits
 - treats missing handoff as an explicit error once the delegated runtime exits instead of inventing completion
 - supports bounded parallel delegated runs through a `tasks` array
+- supports `mode: "wait" | "dispatch"` so long-running runs can continue in the background and steer results back later
+- provides `cli_subagent_resume` to recover the final result for a dispatched run by `runId`
 - closes successful sessions by default and closes failed/timed-out sessions by default unless `retainOnError: true`
 - keeps local path details out of returned metadata by default; opt in with `PI_CLI_SUBAGENT_INCLUDE_DEBUG_PATHS=1`
 - best-effort correlates the run to Codex/Gemini native session metadata when available
@@ -35,9 +37,28 @@ cli_subagent({
   runtime: "codex",
   profile: "codex-default",
   cwd: "/path/to/project",
+  mode: "wait",
   closeOnSuccess: true,
   retainOnError: false,
   profileScope: "user",
+})
+```
+
+```ts
+cli_subagent({
+  task: "run the long codex audit in the background",
+  runtime: "codex",
+  cwd: "/path/to/project",
+  mode: "dispatch",
+  closeOnSuccess: true,
+  retainOnError: false,
+})
+```
+
+```ts
+cli_subagent_resume({
+  runId: "2026-03-21T21-25-06-306Z-93un1uf7",
+  mode: "wait",
 })
 ```
 
@@ -47,6 +68,7 @@ cli_subagent({
     { task: "inspect auth logging gaps", runtime: "codex", cwd: "/path/to/project" },
     { task: "audit billing retry behavior", runtime: "gemini", cwd: "/path/to/project" },
   ],
+  mode: "dispatch",
   maxConcurrency: 2,
   closeOnSuccess: true,
   retainOnError: false,
@@ -55,13 +77,15 @@ cli_subagent({
 ```
 
 ## Result behavior
-- success: returns handoff notes and closes the delegated surface/workspace by default
-- delegated error handoff: returns the delegated notes and closes by default unless `retainOnError: true`
+- `mode: "wait"`: behaves like the original blocking flow and returns the final handoff result directly
+- `mode: "dispatch"`: returns immediately with a `runId`, keeps watching in the background, and steers the final result back later
+- delegated success/error handoff: closes according to `closeOnSuccess` / `retainOnError`
 - no explicit handoff: returns an error payload once the delegated runtime exits without producing one
 - invalid result payload: fails loudly and closes by default instead of silently retrying bad JSON
 - invalid `cwd`: fails before spawning `cmux`
 - timeout: only applies when `PI_CLI_SUBAGENT_MAX_WAIT_MS` is set to a positive millisecond value; otherwise wait is unlimited
 - abort while waiting: returns an error payload and closes by default unless `retainOnError: true`
+- `cli_subagent_resume`: can reattach to a dispatched run by `runId`, keep waiting on its existing delegated surface/workspace, or recover the completed handoff for a finished run
 
 ## Required local dependencies
 - `cmux`
@@ -86,6 +110,8 @@ Optional environment variables:
 ## Caveats
 - completion is explicit, not inferred. the delegated runtime must call `subagent_done`.
 - this is designed for human-supervised interactive runs, not fully headless automation.
+- `dispatch` background watchers are process-local. if the parent Pi session dies before completion, automatic steer-back dies with it too.
+- `cli_subagent_resume` uses persisted run state, so a fresh parent session can keep waiting on an existing delegated run or recover its completed handoff later by `runId`.
 - `transcript.log` is best-effort wrapper output only.
 - native session correlation is best effort and may be absent.
 - bundled defaults use yolo/no-approval behavior because this extension is meant for trusted local use.

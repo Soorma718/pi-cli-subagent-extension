@@ -15,6 +15,7 @@ import {
   createRunPaths,
   discoverProfiles,
   findNativeSession,
+  getRunStateFile,
   mapWithConcurrencyLimit,
   parseCmuxIdentifyOutput,
   parseCmuxLaunchRefs,
@@ -120,6 +121,8 @@ interface SingleTaskProgress {
   transcriptFile?: string;
 }
 
+type CliSubagentMode = "wait" | "dispatch";
+
 interface SingleTaskResult {
   index: number;
   label: string;
@@ -128,6 +131,61 @@ interface SingleTaskResult {
   notes: string;
   contentText: string;
   details: Record<string, unknown>;
+}
+
+interface TaskRuntimeSnapshot {
+  name: RuntimeName;
+  version: string;
+  model?: string;
+  yolo: boolean;
+}
+
+interface TaskProfileSnapshot {
+  name: string;
+  source: CliAgentProfile["source"];
+  filePath?: string;
+}
+
+interface LaunchSnapshot {
+  kind: LaunchHandle["kind"];
+  workspaceId: string;
+  surfaceId?: string;
+  paneId?: string;
+  title: string;
+  transcriptWarning?: string | null;
+}
+
+interface PreparedDelegatedTask {
+  runId: string;
+  task: NormalizedCliSubagentTask;
+  runtime: TaskRuntimeSnapshot;
+  profile: TaskProfileSnapshot;
+  run: RunPaths;
+  launch: LaunchSnapshot;
+  title: string;
+  startedAt: number;
+  cmuxVersion: string;
+}
+
+interface PersistedRunState {
+  version: 1;
+  runId: string;
+  task: NormalizedCliSubagentTask;
+  runtime: TaskRuntimeSnapshot;
+  profile: TaskProfileSnapshot;
+  run: RunPaths;
+  launch: LaunchSnapshot;
+  title: string;
+  startedAt: number;
+  cmuxVersion: string;
+  closeOnSuccess: boolean;
+  retainOnError: boolean;
+}
+
+interface BackgroundDispatchRun {
+  state: PersistedRunState;
+  promise: Promise<SingleTaskResult>;
+  abortController: AbortController;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -194,11 +252,11 @@ async function validateWorkingDirectory(cwd: string): Promise<string | null> {
   }
 }
 
-function buildProfileDetails(profile: CliAgentProfile) {
+function buildProfileDetails(profile: TaskProfileSnapshot | CliAgentProfile) {
   return {
     name: profile.name,
     source: profile.source,
-    ...(INCLUDE_DEBUG_PATHS ? { filePath: profile.filePath } : {}),
+    ...(INCLUDE_DEBUG_PATHS && "filePath" in profile && profile.filePath ? { filePath: profile.filePath } : {}),
   };
 }
 
@@ -216,7 +274,7 @@ function buildPathsDetails(run: RunPaths) {
 }
 
 function buildLaunchDetails(input: {
-  handle: LaunchHandle;
+  handle: LaunchSnapshot;
   title: string;
   cmuxVersion: string;
   closeRequested: boolean;
@@ -383,7 +441,10 @@ async function resolveCallerCmuxContext(pi: ExtensionAPI): Promise<CmuxLaunchRef
   return parsed.caller?.workspaceRef ? parsed.caller : fallback.workspaceRef ? fallback : undefined;
 }
 
-async function readLaunchTail(pi: ExtensionAPI, handle: LaunchHandle): Promise<string> {
+async function readLaunchTail(
+  pi: ExtensionAPI,
+  handle: Pick<LaunchSnapshot, "kind" | "workspaceId" | "surfaceId">
+): Promise<string> {
   const args = ["read-screen", "--scrollback", "--lines", String(SCREEN_TAIL_LINES)];
   if (handle.kind === "surface" && handle.surfaceId) {
     args.push("--workspace", handle.workspaceId, "--surface", handle.surfaceId);
@@ -394,7 +455,11 @@ async function readLaunchTail(pi: ExtensionAPI, handle: LaunchHandle): Promise<s
   return result.code === 0 ? result.stdout.trim() : "";
 }
 
-async function closeLaunchHandle(pi: ExtensionAPI, handle: LaunchHandle, signal?: AbortSignal): Promise<void> {
+async function closeLaunchHandle(
+  pi: ExtensionAPI,
+  handle: Pick<LaunchSnapshot, "kind" | "workspaceId" | "surfaceId">,
+  signal?: AbortSignal
+): Promise<void> {
   if (handle.kind === "surface" && handle.surfaceId) {
     await ensureCmuxCommand(
       pi,
@@ -572,6 +637,341 @@ function finalizeTaskResult(input: {
   };
 }
 
+const runningDispatchRuns = new Map<string, BackgroundDispatchRun>();
+
+async function writeRunState(state: PersistedRunState): Promise<void> {
+  await fs.writeFile(getRunStateFile(state.runId), JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+async function readRunState(runId: string): Promise<PersistedRunState | null> {
+  try {
+    const raw = await fs.readFile(getRunStateFile(runId), "utf8");
+    return JSON.parse(raw) as PersistedRunState;
+  } catch {
+    return null;
+  }
+}
+
+function preparedTaskFromState(state: PersistedRunState): PreparedDelegatedTask {
+  return {
+    runId: state.runId,
+    task: state.task,
+    runtime: state.runtime,
+    profile: state.profile,
+    run: state.run,
+    launch: state.launch,
+    title: state.title,
+    startedAt: state.startedAt,
+    cmuxVersion: state.cmuxVersion,
+  };
+}
+
+function buildDispatchStartedText(state: PersistedRunState): string {
+  return `cli_subagent launched in background. Run id: ${state.runId}. Runtime: ${state.runtime.name}. Task: ${state.task.label}`;
+}
+
+function buildDispatchStartedDetails(state: PersistedRunState, callerContext?: CmuxLaunchRefs) {
+  return {
+    mode: "dispatch",
+    status: "started",
+    runId: state.runId,
+    task: state.task,
+    runtime: state.runtime,
+    profile: buildProfileDetails(state.profile),
+    launch: buildLaunchDetails({
+      handle: state.launch,
+      title: state.title,
+      cmuxVersion: state.cmuxVersion,
+      closeRequested: false,
+      closeError: null,
+    }),
+    callerContext: callerContext ?? null,
+    ...(buildPathsDetails(state.run) ? { paths: buildPathsDetails(state.run) } : {}),
+  };
+}
+
+function buildDispatchCompletionContent(state: PersistedRunState, result: SingleTaskResult): string {
+  return `cli_subagent run \"${state.task.label}\" finished (${result.status}).\nRun id: ${state.runId}.\n\n${result.contentText}`;
+}
+
+async function readCompletedRunResult(state: PersistedRunState): Promise<SingleTaskResult | null> {
+  const rawResult = await maybeReadText(state.run.resultFile);
+  if (rawResult === undefined) return null;
+
+  const classified = classifyResultPayloadFile(rawResult);
+  const payload = classified.payload;
+  const body = payload.notes.trim() ? payload.notes.trim() : "(no handoff notes provided)";
+  const headline = payload.status === "success" ? `${state.runtime.name} handoff captured.` : `${state.runtime.name} reported an error.`;
+
+  return finalizeTaskResult({
+    task: state.task,
+    status: payload.status,
+    notes: body,
+    contentText: `${headline}\n\n${body}`,
+    details: {
+      runId: state.runId,
+      status: payload.status,
+      runtime: state.runtime,
+      profile: buildProfileDetails(state.profile),
+      launch: buildLaunchDetails({
+        handle: state.launch,
+        title: state.title,
+        cmuxVersion: state.cmuxVersion,
+        closeRequested: false,
+        closeError: null,
+      }),
+      workspace: {
+        id: state.launch.workspaceId,
+        title: state.title,
+        closed: false,
+        closeRequested: false,
+        closeError: null,
+        cmuxVersion: state.cmuxVersion,
+      },
+      surface:
+        state.launch.kind === "surface"
+          ? {
+              id: state.launch.surfaceId ?? null,
+              paneId: state.launch.paneId ?? null,
+            }
+          : null,
+      ...(buildPathsDetails(state.run) ? { paths: buildPathsDetails(state.run) } : {}),
+      warnings: state.launch.transcriptWarning ? [state.launch.transcriptWarning] : [],
+      payload: buildPayloadDetails(payload),
+      resumed: true,
+      elapsedMs: Date.now() - state.startedAt,
+      screenTail: "",
+    },
+  });
+}
+
+async function waitForPreparedTask(input: {
+  pi: ExtensionAPI;
+  prepared: PreparedDelegatedTask;
+  signal?: AbortSignal;
+  closeOnSuccess: boolean;
+  retainOnError: boolean;
+  reportProgress?: (progress: SingleTaskProgress) => void;
+}): Promise<SingleTaskResult> {
+  const { pi, prepared } = input;
+  let latestTail = "";
+  const locationLabel =
+    prepared.launch.kind === "surface"
+      ? `${prepared.launch.surfaceId ?? "surface:unknown"} @ ${prepared.launch.workspaceId}`
+      : prepared.launch.workspaceId;
+
+  const buildTaskDetails = (inputDetails: {
+    closeRequested: boolean;
+    closeError?: string | null;
+    nativeSession?: NativeSessionMatch;
+    payload?: Record<string, unknown>;
+    screenTail: string;
+    elapsedMs: number;
+    error?: string;
+    rawResult?: string;
+  }) => ({
+    runId: prepared.runId,
+    ...(inputDetails.error ? { error: inputDetails.error } : {}),
+    runtime: prepared.runtime,
+    profile: buildProfileDetails(prepared.profile),
+    launch: buildLaunchDetails({
+      handle: prepared.launch,
+      title: prepared.title,
+      cmuxVersion: prepared.cmuxVersion,
+      closeRequested: inputDetails.closeRequested,
+      closeError: inputDetails.closeError,
+    }),
+    workspace: {
+      id: prepared.launch.workspaceId,
+      title: prepared.title,
+      closed: inputDetails.closeRequested && !inputDetails.closeError,
+      closeRequested: inputDetails.closeRequested,
+      closeError: inputDetails.closeError ?? null,
+      cmuxVersion: prepared.cmuxVersion,
+    },
+    surface:
+      prepared.launch.kind === "surface"
+        ? {
+            id: prepared.launch.surfaceId ?? null,
+            paneId: prepared.launch.paneId ?? null,
+          }
+        : null,
+    ...(buildPathsDetails(prepared.run) ? { paths: buildPathsDetails(prepared.run) } : {}),
+    warnings: appendWarnings([prepared.launch.transcriptWarning], inputDetails.closeError),
+    nativeSession: buildNativeSessionDetails(inputDetails.nativeSession),
+    ...(inputDetails.payload ? { payload: buildPayloadDetails(inputDetails.payload) } : {}),
+    ...(INCLUDE_DEBUG_PATHS && inputDetails.rawResult !== undefined ? { rawResult: inputDetails.rawResult } : {}),
+    screenTail: inputDetails.screenTail,
+    elapsedMs: inputDetails.elapsedMs,
+  });
+
+  const finalizeTerminalError = async (errorCode: string, message: string, options: { rawResult?: string; elapsedMs: number }) => {
+    latestTail = await readLaunchTail(pi, prepared.launch);
+    const closeRequested = !input.retainOnError;
+    let closeError: string | null = null;
+    if (closeRequested) {
+      try {
+        await closeLaunchHandle(pi, prepared.launch, input.signal);
+      } catch (error) {
+        closeError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const finalMessage = closeError ? `${message}\n\nCleanup warning: ${closeError}` : message;
+    input.reportProgress?.({
+      index: prepared.task.index,
+      label: prepared.task.label,
+      phase: "error",
+      runtime: prepared.runtime.name,
+      profile: prepared.profile.name,
+      elapsedMs: options.elapsedMs,
+      locationLabel,
+      screenTail: latestTail,
+      notes: finalMessage,
+      ...(INCLUDE_DEBUG_PATHS
+        ? {
+            runDir: prepared.run.runDir,
+            handoffFile: prepared.run.handoffFile,
+            transcriptFile: prepared.run.transcriptFile,
+          }
+        : {}),
+    });
+
+    return finalizeTaskResult({
+      task: prepared.task,
+      status: "error",
+      notes: finalMessage,
+      contentText: finalMessage,
+      details: buildTaskDetails({
+        error: errorCode,
+        closeRequested,
+        closeError,
+        screenTail: latestTail,
+        elapsedMs: options.elapsedMs,
+        rawResult: options.rawResult,
+      }),
+    });
+  };
+
+  try {
+    while (true) {
+      if (input.signal?.aborted) {
+        return finalizeTerminalError("aborted", `cli_subagent aborted while waiting for ${prepared.runtime.name} handoff.`, {
+          elapsedMs: Date.now() - prepared.startedAt,
+        });
+      }
+
+      const elapsedMs = Date.now() - prepared.startedAt;
+      if (HANDOFF_TIMEOUT_MS !== null && elapsedMs >= HANDOFF_TIMEOUT_MS) {
+        return finalizeTerminalError(
+          "handoff_timeout",
+          `Timed out waiting for ${prepared.runtime.name} handoff after ${Math.round(HANDOFF_TIMEOUT_MS / 1000)}s.`,
+          { elapsedMs }
+        );
+      }
+
+      const rawResult = await maybeReadText(prepared.run.resultFile);
+      if (rawResult !== undefined) {
+        try {
+          const classified = classifyResultPayloadFile(rawResult);
+          const payload = classified.payload;
+          latestTail = await readLaunchTail(pi, prepared.launch);
+          const nativeSession = await findNativeSessionWithRetry({
+            runtime: prepared.runtime.name,
+            marker: prepared.run.handoffFile,
+            startedAt: prepared.startedAt,
+            signal: input.signal,
+          });
+          const closeRequested = payload.status === "success" ? input.closeOnSuccess : !input.retainOnError;
+          let closeError: string | null = null;
+          if (closeRequested) {
+            try {
+              await closeLaunchHandle(pi, prepared.launch, input.signal);
+            } catch (error) {
+              closeError = error instanceof Error ? error.message : String(error);
+            }
+          }
+
+          const headline = payload.status === "success" ? `${prepared.runtime.name} handoff captured.` : `${prepared.runtime.name} reported an error.`;
+          const body = payload.notes.trim() ? payload.notes.trim() : "(no handoff notes provided)";
+          const finalBody = closeError ? `${body}\n\nCleanup warning: ${closeError}` : body;
+          input.reportProgress?.({
+            index: prepared.task.index,
+            label: prepared.task.label,
+            phase: payload.status,
+            runtime: prepared.runtime.name,
+            profile: prepared.profile.name,
+            elapsedMs,
+            locationLabel,
+            screenTail: latestTail,
+            notes: finalBody,
+            ...(INCLUDE_DEBUG_PATHS
+              ? {
+                  runDir: prepared.run.runDir,
+                  handoffFile: prepared.run.handoffFile,
+                  transcriptFile: prepared.run.transcriptFile,
+                }
+              : {}),
+          });
+
+          return finalizeTaskResult({
+            task: prepared.task,
+            status: payload.status,
+            notes: finalBody,
+            contentText: `${headline}\n\n${finalBody}`,
+            details: {
+              status: payload.status,
+              ...buildTaskDetails({
+                closeRequested,
+                closeError,
+                nativeSession,
+                payload,
+                screenTail: latestTail,
+                elapsedMs,
+              }),
+            },
+          });
+        } catch (error) {
+          return finalizeTerminalError(
+            "invalid_result_payload",
+            `Invalid delegated result payload: ${error instanceof Error ? error.message : String(error)}`,
+            { rawResult, elapsedMs }
+          );
+        }
+      }
+
+      latestTail = await readLaunchTail(pi, prepared.launch);
+      input.reportProgress?.({
+        index: prepared.task.index,
+        label: prepared.task.label,
+        phase: "waiting",
+        runtime: prepared.runtime.name,
+        profile: prepared.profile.name,
+        elapsedMs,
+        locationLabel,
+        screenTail: latestTail,
+        ...(INCLUDE_DEBUG_PATHS
+          ? {
+              runDir: prepared.run.runDir,
+              handoffFile: prepared.run.handoffFile,
+              transcriptFile: prepared.run.transcriptFile,
+            }
+          : {}),
+      });
+      await sleep(POLL_INTERVAL_MS, input.signal);
+    }
+  } catch (error) {
+    const aborted = input.signal?.aborted || (error instanceof Error && error.message === "cli_subagent wait aborted");
+    return finalizeTerminalError(
+      aborted ? "aborted" : "wait_failed",
+      aborted
+        ? `cli_subagent aborted while waiting for ${prepared.runtime.name} handoff.`
+        : `cli_subagent failed while waiting for ${prepared.runtime.name} handoff: ${error instanceof Error ? error.message : String(error)}`,
+      { elapsedMs: Date.now() - prepared.startedAt }
+    );
+  }
+}
+
 async function runDelegatedTask(input: {
   pi: ExtensionAPI;
   task: NormalizedCliSubagentTask;
@@ -583,6 +983,7 @@ async function runDelegatedTask(input: {
   callerContext?: CmuxLaunchRefs;
   runtimeVersionCache: Map<RuntimeName, string>;
   reportProgress?: (progress: SingleTaskProgress) => void;
+  onLaunched?: (state: PersistedRunState) => Promise<void> | void;
 }): Promise<SingleTaskResult> {
   const { pi, task } = input;
   const { profiles, projectProfilesDir } = await discoverProfiles(task.cwd, input.profileScope);
@@ -711,231 +1112,167 @@ async function runDelegatedTask(input: {
   }
 
   const startedAt = Date.now();
-  let latestTail = "";
-  const locationLabel = buildLocationLabel(handle);
-
-  const buildTaskDetails = (inputDetails: {
-    closeRequested: boolean;
-    closeError?: string | null;
-    nativeSession?: NativeSessionMatch;
-    payload?: Record<string, unknown>;
-    screenTail: string;
-    elapsedMs: number;
-    error?: string;
-    rawResult?: string;
-  }) => ({
-    ...(inputDetails.error ? { error: inputDetails.error } : {}),
+  const preparedState: PersistedRunState = {
+    version: 1,
+    runId: run.runId,
+    task,
     runtime: {
       name: profile.runtime,
       version: runtimeVersion,
       model: profile.model,
       yolo: profile.yolo,
     },
-    profile: buildProfileDetails(profile),
-    launch: buildLaunchDetails({
-      handle,
-      title,
-      cmuxVersion: input.cmuxVersion,
-      closeRequested: inputDetails.closeRequested,
-      closeError: inputDetails.closeError,
-    }),
-    workspace: {
-      id: handle.workspaceId,
-      title,
-      closed: inputDetails.closeRequested && !inputDetails.closeError,
-      closeRequested: inputDetails.closeRequested,
-      closeError: inputDetails.closeError ?? null,
-      cmuxVersion: input.cmuxVersion,
+    profile: {
+      name: profile.name,
+      source: profile.source,
+      filePath: profile.filePath,
     },
-    surface:
-      handle.kind === "surface"
-        ? {
-            id: handle.surfaceId ?? null,
-            paneId: handle.paneId ?? null,
-          }
-        : null,
-    ...(buildPathsDetails(run) ? { paths: buildPathsDetails(run) } : {}),
-    warnings: appendWarnings([handle.transcriptWarning], inputDetails.closeError),
-    nativeSession: buildNativeSessionDetails(inputDetails.nativeSession),
-    ...(inputDetails.payload ? { payload: buildPayloadDetails(inputDetails.payload) } : {}),
-    ...(INCLUDE_DEBUG_PATHS && inputDetails.rawResult !== undefined ? { rawResult: inputDetails.rawResult } : {}),
-    screenTail: inputDetails.screenTail,
-    elapsedMs: inputDetails.elapsedMs,
+    run,
+    launch: {
+      kind: handle.kind,
+      workspaceId: handle.workspaceId,
+      surfaceId: handle.surfaceId,
+      paneId: handle.paneId,
+      title,
+      transcriptWarning: handle.transcriptWarning ?? null,
+    },
+    title,
+    startedAt,
+    cmuxVersion: input.cmuxVersion,
+    closeOnSuccess: input.closeOnSuccess,
+    retainOnError: input.retainOnError,
+  };
+  await writeRunState(preparedState);
+  await input.onLaunched?.(preparedState);
+
+  return waitForPreparedTask({
+    pi,
+    prepared: preparedTaskFromState(preparedState),
+    signal: input.signal,
+    closeOnSuccess: input.closeOnSuccess,
+    retainOnError: input.retainOnError,
+    reportProgress: input.reportProgress,
+  });
+}
+
+function monitorDispatchedRun(
+  pi: ExtensionAPI,
+  state: PersistedRunState,
+  promise: Promise<SingleTaskResult>,
+  abortController: AbortController
+) {
+  runningDispatchRuns.set(state.runId, {
+    state,
+    promise,
+    abortController,
   });
 
-  const finalizeTerminalError = async (errorCode: string, message: string, options: { rawResult?: string; elapsedMs: number }) => {
-    latestTail = await readLaunchTail(pi, handle);
-    const closeRequested = !input.retainOnError;
-    let closeError: string | null = null;
-    if (closeRequested) {
-      try {
-        await closeLaunchHandle(pi, handle, input.signal);
-      } catch (error) {
-        closeError = error instanceof Error ? error.message : String(error);
-      }
-    }
-
-    const finalMessage = closeError ? `${message}\n\nCleanup warning: ${closeError}` : message;
-    input.reportProgress?.({
-      index: task.index,
-      label: task.label,
-      phase: "error",
-      runtime: profile.runtime,
-      profile: profile.name,
-      elapsedMs: options.elapsedMs,
-      locationLabel,
-      screenTail: latestTail,
-      notes: finalMessage,
-      ...(INCLUDE_DEBUG_PATHS
-        ? {
-            runDir: run.runDir,
-            handoffFile: run.handoffFile,
-            transcriptFile: run.transcriptFile,
-          }
-        : {}),
+  promise
+    .then((result) => {
+      runningDispatchRuns.delete(state.runId);
+      const sendMessage = (pi as ExtensionAPI & { sendMessage?: Function }).sendMessage;
+      sendMessage?.(
+        {
+          customType: "cli_subagent_result",
+          content: buildDispatchCompletionContent(state, result),
+          display: true,
+          details: {
+            mode: "dispatch",
+            runId: state.runId,
+            result: result.details,
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" }
+      );
+    })
+    .catch((error) => {
+      runningDispatchRuns.delete(state.runId);
+      const sendMessage = (pi as ExtensionAPI & { sendMessage?: Function }).sendMessage;
+      sendMessage?.(
+        {
+          customType: "cli_subagent_result",
+          content: `cli_subagent run \"${state.task.label}\" failed unexpectedly.\nRun id: ${state.runId}.\n\n${error instanceof Error ? error.message : String(error)}`,
+          display: true,
+          details: {
+            mode: "dispatch",
+            runId: state.runId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" }
+      );
     });
+}
 
-    return finalizeTaskResult({
-      task,
-      status: "error",
-      notes: finalMessage,
-      contentText: finalMessage,
-      details: buildTaskDetails({
-        error: errorCode,
-        closeRequested,
-        closeError,
-        screenTail: latestTail,
-        elapsedMs: options.elapsedMs,
-        rawResult: options.rawResult,
-      }),
+async function startDispatchedTask(input: {
+  pi: ExtensionAPI;
+  task: NormalizedCliSubagentTask;
+  profileScope: ProfileScope;
+  closeOnSuccess: boolean;
+  retainOnError: boolean;
+  cmuxVersion: string;
+  callerContext?: CmuxLaunchRefs;
+  runtimeVersionCache: Map<RuntimeName, string>;
+}): Promise<{ ok: true; state: PersistedRunState } | { ok: false; result: SingleTaskResult }> {
+  let launchedState: PersistedRunState | undefined;
+  let resolveLaunched: ((state: PersistedRunState) => void) | undefined;
+  const launchedPromise = new Promise<PersistedRunState>((resolve) => {
+    resolveLaunched = resolve;
+  });
+
+  const abortController = new AbortController();
+  let watchPromise!: Promise<SingleTaskResult>;
+  watchPromise = runDelegatedTask({
+    pi: input.pi,
+    task: input.task,
+    signal: abortController.signal,
+    profileScope: input.profileScope,
+    closeOnSuccess: input.closeOnSuccess,
+    retainOnError: input.retainOnError,
+    cmuxVersion: input.cmuxVersion,
+    callerContext: input.callerContext,
+    runtimeVersionCache: input.runtimeVersionCache,
+    onLaunched(state) {
+      launchedState = state;
+      monitorDispatchedRun(input.pi, state, watchPromise, abortController);
+      resolveLaunched?.(state);
+    },
+  });
+
+  const prelaunchFailurePromise = new Promise<{ kind: "finished"; result: SingleTaskResult }>((resolve) => {
+    watchPromise.then((result) => {
+      if (!launchedState) {
+        resolve({ kind: "finished", result });
+      }
     });
-  };
+  });
 
-  try {
-    while (true) {
-      if (input.signal?.aborted) {
-        return finalizeTerminalError("aborted", `cli_subagent aborted while waiting for ${profile.runtime} handoff.`, {
-          elapsedMs: Date.now() - startedAt,
-        });
-      }
+  const first = await Promise.race([
+    launchedPromise.then((state) => ({ kind: "launched" as const, state })),
+    prelaunchFailurePromise,
+  ]);
 
-      const elapsedMs = Date.now() - startedAt;
-      if (HANDOFF_TIMEOUT_MS !== null && elapsedMs >= HANDOFF_TIMEOUT_MS) {
-        return finalizeTerminalError(
-          "handoff_timeout",
-          `Timed out waiting for ${profile.runtime} handoff after ${Math.round(HANDOFF_TIMEOUT_MS / 1000)}s.`,
-          { elapsedMs }
-        );
-      }
-
-      const rawResult = await maybeReadText(run.resultFile);
-      if (rawResult !== undefined) {
-        try {
-          const classified = classifyResultPayloadFile(rawResult);
-          const payload = classified.payload;
-          latestTail = await readLaunchTail(pi, handle);
-          const nativeSession = await findNativeSessionWithRetry({
-            runtime: profile.runtime,
-            marker: run.handoffFile,
-            startedAt,
-            signal: input.signal,
-          });
-          const closeRequested = payload.status === "success" ? input.closeOnSuccess : !input.retainOnError;
-          let closeError: string | null = null;
-          if (closeRequested) {
-            try {
-              await closeLaunchHandle(pi, handle, input.signal);
-            } catch (error) {
-              closeError = error instanceof Error ? error.message : String(error);
-            }
-          }
-
-          const headline = payload.status === "success" ? `${profile.runtime} handoff captured.` : `${profile.runtime} reported an error.`;
-          const body = payload.notes.trim() ? payload.notes.trim() : "(no handoff notes provided)";
-          const finalBody = closeError ? `${body}\n\nCleanup warning: ${closeError}` : body;
-          input.reportProgress?.({
-            index: task.index,
-            label: task.label,
-            phase: payload.status,
-            runtime: profile.runtime,
-            profile: profile.name,
-            elapsedMs,
-            locationLabel,
-            screenTail: latestTail,
-            notes: finalBody,
-            ...(INCLUDE_DEBUG_PATHS
-              ? {
-                  runDir: run.runDir,
-                  handoffFile: run.handoffFile,
-                  transcriptFile: run.transcriptFile,
-                }
-              : {}),
-          });
-
-          return finalizeTaskResult({
-            task,
-            status: payload.status,
-            notes: finalBody,
-            contentText: `${headline}\n\n${finalBody}`,
-            details: {
-              status: payload.status,
-              ...buildTaskDetails({
-                closeRequested,
-                closeError,
-                nativeSession,
-                payload,
-                screenTail: latestTail,
-                elapsedMs,
-              }),
-            },
-          });
-        } catch (error) {
-          return finalizeTerminalError(
-            "invalid_result_payload",
-            `Invalid delegated result payload: ${error instanceof Error ? error.message : String(error)}`,
-            { rawResult, elapsedMs }
-          );
-        }
-      }
-
-      latestTail = await readLaunchTail(pi, handle);
-      input.reportProgress?.({
-        index: task.index,
-        label: task.label,
-        phase: "waiting",
-        runtime: profile.runtime,
-        profile: profile.name,
-        elapsedMs,
-        locationLabel,
-        screenTail: latestTail,
-        ...(INCLUDE_DEBUG_PATHS
-          ? {
-              runDir: run.runDir,
-              handoffFile: run.handoffFile,
-              transcriptFile: run.transcriptFile,
-            }
-          : {}),
-      });
-      await sleep(POLL_INTERVAL_MS, input.signal);
-    }
-  } catch (error) {
-    const aborted = input.signal?.aborted || (error instanceof Error && error.message === "cli_subagent wait aborted");
-    return finalizeTerminalError(
-      aborted ? "aborted" : "wait_failed",
-      aborted
-        ? `cli_subagent aborted while waiting for ${profile.runtime} handoff.`
-        : `cli_subagent failed while waiting for ${profile.runtime} handoff: ${error instanceof Error ? error.message : String(error)}`,
-      { elapsedMs: Date.now() - startedAt }
-    );
+  if (first.kind === "finished") {
+    return { ok: false, result: first.result };
   }
+
+  return { ok: true, state: first.state };
 }
 
 export default function (pi: ExtensionAPI) {
+  const piWithEvents = pi as ExtensionAPI & { on?: Function };
+  piWithEvents.on?.("session_shutdown", () => {
+    for (const run of runningDispatchRuns.values()) {
+      run.abortController.abort();
+    }
+    runningDispatchRuns.clear();
+  });
+
   pi.registerTool({
     name: "cli_subagent",
     label: "CLI Subagent",
     description:
-      "Launch Codex or Gemini in cmux, keep the delegated session steerable, and wait for explicit handoff back via subagent_done. Supports single-task and bounded parallel task mode.",
+      "Launch Codex or Gemini in cmux, keep the delegated session steerable, and wait for explicit handoff back via subagent_done. Supports blocking wait mode and non-blocking dispatch mode.",
     parameters: Type.Object({
       task: Type.Optional(Type.String({ description: "Task to delegate to the CLI runtime (single-run mode)" })),
       tasks: Type.Optional(Type.Array(CliSubagentTaskSchema, { description: "Parallel delegated tasks to run in bounded concurrency" })),
@@ -945,6 +1282,11 @@ export default function (pi: ExtensionAPI) {
       profile: Type.Optional(Type.String({ description: "Named CLI profile from bundled defaults, ~/.pi/agent/cli-agents, or .pi/cli-agents" })),
       cwd: Type.Optional(Type.String({ description: "Working directory for the delegated session" })),
       title: Type.Optional(Type.String({ description: "Optional cmux workspace or tab title override" })),
+      mode: Type.Optional(
+        StringEnum(["wait", "dispatch"] as const, {
+          description: "wait = block for the handoff result; dispatch = return immediately and steer the result back later",
+        })
+      ),
       closeOnSuccess: Type.Optional(Type.Boolean({ description: "Close the delegated cmux surface/workspace after a successful handoff" })),
       retainOnError: Type.Optional(Type.Boolean({ description: "Keep the delegated cmux surface/workspace open on timeout, abort, or error results" })),
       maxConcurrency: Type.Optional(Type.Number({ description: "Maximum in-flight delegated runs for parallel mode" })),
@@ -975,6 +1317,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      const mode = (params.mode ?? "wait") as CliSubagentMode;
       const closeOnSuccess = params.closeOnSuccess ?? true;
       const retainOnError = params.retainOnError ?? false;
       const profileScope = (params.profileScope ?? "user") as ProfileScope;
@@ -1051,7 +1394,7 @@ export default function (pi: ExtensionAPI) {
         });
       };
 
-      const runTask = async (task: NormalizedCliSubagentTask) =>
+      const waitTask = async (task: NormalizedCliSubagentTask) =>
         runDelegatedTask({
           pi,
           task,
@@ -1065,8 +1408,67 @@ export default function (pi: ExtensionAPI) {
           reportProgress: normalizedTasks.tasks.length === 1 ? emitSingleProgress : emitParallelProgress,
         });
 
+      const dispatchTask = async (task: NormalizedCliSubagentTask) =>
+        startDispatchedTask({
+          pi,
+          task,
+          profileScope,
+          closeOnSuccess,
+          retainOnError,
+          cmuxVersion: cmuxCheck.version,
+          callerContext,
+          runtimeVersionCache,
+        });
+
+      if (mode === "dispatch") {
+        if (normalizedTasks.tasks.length === 1) {
+          const launched = await dispatchTask(normalizedTasks.tasks[0]);
+          if (!launched.ok) {
+            return {
+              isError: launched.result.isError,
+              content: [{ type: "text", text: launched.result.contentText }],
+              details: {
+                mode: "single",
+                result: launched.result.details,
+                callerContext: callerContext ?? null,
+              },
+            };
+          }
+
+          return {
+            isError: false,
+            content: [{ type: "text", text: buildDispatchStartedText(launched.state) }],
+            details: buildDispatchStartedDetails(launched.state, callerContext),
+          };
+        }
+
+        const launchedStates = await mapWithConcurrencyLimit(normalizedTasks.tasks, maxConcurrency, async (task) => dispatchTask(task));
+        const failures = launchedStates.filter((item): item is { ok: false; result: SingleTaskResult } => !item.ok);
+        const started = launchedStates.filter((item): item is { ok: true; state: PersistedRunState } => item.ok);
+        const lines = [
+          `cli_subagent dispatch started ${started.length}/${normalizedTasks.tasks.length} runs.`,
+          ...started.map((item) => `[${item.state.task.label}] started: ${item.state.runId}`),
+          ...failures.map((item) => `[${item.result.label}] error: ${item.result.notes}`),
+        ];
+
+        return {
+          isError: failures.length > 0,
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: {
+            mode: "dispatch",
+            total: normalizedTasks.tasks.length,
+            startedCount: started.length,
+            errorCount: failures.length,
+            maxConcurrency,
+            callerContext: callerContext ?? null,
+            runs: started.map((item) => buildDispatchStartedDetails(item.state, callerContext)),
+            errors: failures.map((item) => item.result.details),
+          },
+        };
+      }
+
       if (normalizedTasks.tasks.length === 1) {
-        const result = await runTask(normalizedTasks.tasks[0]);
+        const result = await waitTask(normalizedTasks.tasks[0]);
         return {
           isError: result.isError,
           content: [{ type: "text", text: result.contentText }],
@@ -1078,7 +1480,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const results = await mapWithConcurrencyLimit(normalizedTasks.tasks, maxConcurrency, async (task) => runTask(task));
+      const results = await mapWithConcurrencyLimit(normalizedTasks.tasks, maxConcurrency, async (task) => waitTask(task));
       const summary = buildParallelSummaryText(
         results.map((result) => ({
           label: result.label,
@@ -1098,6 +1500,101 @@ export default function (pi: ExtensionAPI) {
           maxConcurrency,
           callerContext: callerContext ?? null,
           results: results.map((result) => result.details),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "cli_subagent_resume",
+    label: "CLI Subagent Resume",
+    description:
+      "Resume observing a previously dispatched cli_subagent run by run id. Use wait mode to block for the final result, or dispatch mode to keep watching in the background.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "Run id returned by cli_subagent dispatch mode" }),
+      mode: Type.Optional(
+        StringEnum(["wait", "dispatch"] as const, {
+          description: "wait = block for completion now; dispatch = keep or restart background observation",
+        })
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const mode = (params.mode ?? "wait") as CliSubagentMode;
+      const active = runningDispatchRuns.get(params.runId);
+      if (active) {
+        if (mode === "dispatch") {
+          return {
+            isError: false,
+            content: [{ type: "text", text: `cli_subagent run ${params.runId} is already being watched in the background.` }],
+            details: buildDispatchStartedDetails(active.state),
+          };
+        }
+
+        const result = await active.promise;
+        return {
+          isError: result.isError,
+          content: [{ type: "text", text: result.contentText }],
+          details: {
+            mode: "resume",
+            runId: params.runId,
+            result: result.details,
+          },
+        };
+      }
+
+      const state = await readRunState(params.runId);
+      if (!state) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Unknown cli_subagent run id: ${params.runId}` }],
+          details: { error: "unknown_run", runId: params.runId },
+        };
+      }
+
+      const completed = await readCompletedRunResult(state);
+      if (completed) {
+        return {
+          isError: completed.isError,
+          content: [{ type: "text", text: completed.contentText }],
+          details: {
+            mode: "resume",
+            runId: params.runId,
+            result: completed.details,
+          },
+        };
+      }
+
+      const prepared = preparedTaskFromState(state);
+      if (mode === "dispatch") {
+        const abortController = new AbortController();
+        const promise = waitForPreparedTask({
+          pi,
+          prepared,
+          signal: abortController.signal,
+          closeOnSuccess: state.closeOnSuccess,
+          retainOnError: state.retainOnError,
+        });
+        monitorDispatchedRun(pi, state, promise, abortController);
+        return {
+          isError: false,
+          content: [{ type: "text", text: `cli_subagent background watch restarted for run ${params.runId}.` }],
+          details: buildDispatchStartedDetails(state),
+        };
+      }
+
+      const result = await waitForPreparedTask({
+        pi,
+        prepared,
+        closeOnSuccess: state.closeOnSuccess,
+        retainOnError: state.retainOnError,
+      });
+      return {
+        isError: result.isError,
+        content: [{ type: "text", text: result.contentText }],
+        details: {
+          mode: "resume",
+          runId: params.runId,
+          result: result.details,
         },
       };
     },

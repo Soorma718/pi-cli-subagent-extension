@@ -758,9 +758,17 @@ export async function findNativeSession(input: FindNativeSessionInput): Promise<
   return undefined;
 }
 
+export function getRunDir(runId: string): string {
+  return path.join(RUN_ROOT, runId);
+}
+
+export function getRunStateFile(runId: string): string {
+  return path.join(getRunDir(runId), "state.json");
+}
+
 export async function createRunPaths(): Promise<RunPaths> {
   const runId = createRunId();
-  const runDir = path.join(RUN_ROOT, runId);
+  const runDir = getRunDir(runId);
   await fs.mkdir(runDir, { recursive: true });
   return {
     runId,

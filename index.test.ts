@@ -45,34 +45,43 @@ afterEach(async () => {
 });
 
 function createHarness(execImpl: (binary: string, args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>) {
-  let registeredTool:
-    | {
-        execute: (
-          toolCallId: string,
-          params: Record<string, unknown>,
-          signal: AbortSignal | undefined,
-          onUpdate: ((update: unknown) => void) | undefined,
-          ctx: { cwd: string }
-        ) => Promise<any>;
-      }
-    | undefined;
+  const registeredTools = new Map<
+    string,
+    {
+      execute: (
+        toolCallId: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+        onUpdate: ((update: unknown) => void) | undefined,
+        ctx: { cwd: string }
+      ) => Promise<any>;
+    }
+  >();
+  const sentMessages: Array<{ message: any; options: any }> = [];
 
   const pi = {
-    registerTool(tool: typeof registeredTool) {
-      registeredTool = tool;
+    registerTool(tool: { name: string } & { execute: any }) {
+      registeredTools.set(tool.name, tool);
     },
     exec(binary: string, args: string[]) {
       return execImpl(binary, args);
     },
+    sendMessage(message: any, options: any) {
+      sentMessages.push({ message, options });
+    },
   } as unknown as ExtensionAPI;
 
   registerCliSubagent(pi);
-  if (!registeredTool) throw new Error("cli_subagent tool was not registered");
+  if (!registeredTools.has("cli_subagent")) throw new Error("cli_subagent tool was not registered");
+  if (!registeredTools.has("cli_subagent_resume")) throw new Error("cli_subagent_resume tool was not registered");
 
   return {
-    execute(params: Record<string, unknown>, cwd: string) {
-      return registeredTool!.execute("toolcall-1", params, undefined, undefined, { cwd });
+    execute(toolName: string, params: Record<string, unknown>, cwd: string) {
+      const tool = registeredTools.get(toolName);
+      if (!tool) throw new Error(`Tool not registered: ${toolName}`);
+      return tool.execute("toolcall-1", params, undefined, undefined, { cwd });
     },
+    sentMessages,
   };
 }
 
@@ -108,6 +117,7 @@ describe("cli_subagent tool", () => {
     });
 
     const result = await harness.execute(
+      "cli_subagent",
       {
         task: "write a handoff and exit",
         runtime: "codex",
@@ -153,6 +163,7 @@ describe("cli_subagent tool", () => {
     });
 
     const result = await harness.execute(
+      "cli_subagent",
       {
         task: "write a handoff and exit",
         runtime: "codex",
@@ -199,6 +210,7 @@ describe("cli_subagent tool", () => {
     });
 
     const result = await harness.execute(
+      "cli_subagent",
       {
         task: "write a handoff and exit",
         runtime: "codex",
@@ -212,5 +224,116 @@ describe("cli_subagent tool", () => {
     expect(result.details.result.launch.closed).toBe(false);
     expect(result.details.result.launch.closeRequested).toBe(false);
     expect(closeWorkspaceCalls).toBe(0);
+  });
+
+  it("dispatches a run in the background and steers completion back later", async () => {
+    const cwd = await makeTempDir();
+    let closeWorkspaceCalls = 0;
+
+    const harness = createHarness(async (binary, args) => {
+      if (binary === "cmux" && args[0] === "--version") return { code: 0, stdout: "cmux 1.0.0\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "identify") return { code: 1, stdout: "", stderr: "not in cmux" };
+      if (binary === "codex" && args[0] === "--version") return { code: 0, stdout: "codex 1.2.3\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "new-workspace") {
+        const launcherPath = extractLauncherPath(args[args.indexOf("--command") + 1]);
+        const runDir = path.dirname(launcherPath);
+        await fs.writeFile(
+          path.join(runDir, "result.json"),
+          JSON.stringify({ status: "success", notes: "background done" }) + "\n",
+          "utf8"
+        );
+        return { code: 0, stdout: "OK workspace:31\n", stderr: "" };
+      }
+      if (binary === "cmux" && args[0] === "rename-workspace") return { code: 0, stdout: "OK\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "pipe-pane") return { code: 0, stdout: "OK\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "read-screen") return { code: 0, stdout: "tail line\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "close-workspace") {
+        closeWorkspaceCalls += 1;
+        return { code: 0, stdout: "OK\n", stderr: "" };
+      }
+
+      throw new Error(`Unexpected exec: ${binary} ${args.join(" ")}`);
+    });
+
+    const result = await harness.execute(
+      "cli_subagent",
+      {
+        task: "write a handoff and exit",
+        runtime: "codex",
+        cwd,
+        mode: "dispatch",
+      },
+      cwd
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.details.mode).toBe("dispatch");
+    expect(result.details.runId).toBeTruthy();
+    expect(result.content[0].text).toContain("launched in background");
+
+    for (let attempt = 0; attempt < 80 && harness.sentMessages.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    expect(closeWorkspaceCalls).toBe(1);
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0].options).toMatchObject({ triggerTurn: true, deliverAs: "steer" });
+    expect(harness.sentMessages[0].message.content).toContain("background done");
+    expect(harness.sentMessages[0].message.details.runId).toBe(result.details.runId);
+  });
+
+  it("can resume a completed dispatched run by run id", async () => {
+    const cwd = await makeTempDir();
+
+    const harness = createHarness(async (binary, args) => {
+      if (binary === "cmux" && args[0] === "--version") return { code: 0, stdout: "cmux 1.0.0\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "identify") return { code: 1, stdout: "", stderr: "not in cmux" };
+      if (binary === "codex" && args[0] === "--version") return { code: 0, stdout: "codex 1.2.3\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "new-workspace") {
+        const launcherPath = extractLauncherPath(args[args.indexOf("--command") + 1]);
+        const runDir = path.dirname(launcherPath);
+        await fs.writeFile(
+          path.join(runDir, "result.json"),
+          JSON.stringify({ status: "success", notes: "resume me" }) + "\n",
+          "utf8"
+        );
+        return { code: 0, stdout: "OK workspace:41\n", stderr: "" };
+      }
+      if (binary === "cmux" && args[0] === "rename-workspace") return { code: 0, stdout: "OK\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "pipe-pane") return { code: 0, stdout: "OK\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "read-screen") return { code: 0, stdout: "tail line\n", stderr: "" };
+      if (binary === "cmux" && args[0] === "close-workspace") return { code: 0, stdout: "OK\n", stderr: "" };
+
+      throw new Error(`Unexpected exec: ${binary} ${args.join(" ")}`);
+    });
+
+    const started = await harness.execute(
+      "cli_subagent",
+      {
+        task: "write a handoff and exit",
+        runtime: "codex",
+        cwd,
+        mode: "dispatch",
+      },
+      cwd
+    );
+
+    const runId = started.details.runId as string;
+    for (let attempt = 0; attempt < 80 && harness.sentMessages.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const resumed = await harness.execute(
+      "cli_subagent_resume",
+      {
+        runId,
+      },
+      cwd
+    );
+
+    expect(resumed.isError).toBe(false);
+    expect(resumed.details.mode).toBe("resume");
+    expect(resumed.details.runId).toBe(runId);
+    expect(resumed.content[0].text).toContain("resume me");
   });
 });
