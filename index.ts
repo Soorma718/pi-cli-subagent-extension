@@ -188,6 +188,88 @@ interface BackgroundDispatchRun {
   abortController: AbortController;
 }
 
+let latestWidgetCtx: any = null;
+let dispatchWidgetInterval: ReturnType<typeof setInterval> | null = null;
+
+function truncatePlain(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (text.length <= width) return text.padEnd(width, " ");
+  if (width === 1) return "…";
+  return `${text.slice(0, width - 1)}…`;
+}
+
+function formatDispatchElapsedMMSS(startedAt: number, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+export function buildDispatchWidgetLines(
+  runs: Array<{ runtime: { name: string }; task: { label: string }; startedAt: number }>,
+  width: number,
+  now = Date.now()
+): string[] {
+  const safeWidth = Math.max(24, width);
+  const innerWidth = safeWidth - 2;
+  const title = "─ CLI Subagents ";
+  const info = ` ${runs.length} running ─`;
+  const topFill = Math.max(0, innerWidth - title.length - info.length);
+  const top = `╭${title}${"─".repeat(topFill)}${info}`.slice(0, safeWidth - 1).padEnd(safeWidth - 1, "─") + "╮";
+
+  const body = runs.slice(0, 3).map((run) => {
+    const text = ` ${formatDispatchElapsedMMSS(run.startedAt, now)}  ${run.runtime.name}  ${run.task.label} `;
+    return `│${truncatePlain(text, innerWidth)}│`;
+  });
+
+  if (runs.length > 3) {
+    body.push(`│${truncatePlain(` +${runs.length - 3} more `, innerWidth)}│`);
+  }
+
+  const bottom = `╰${"─".repeat(innerWidth)}╯`;
+  return [top, ...body, bottom];
+}
+
+function updateDispatchWidget() {
+  if (!latestWidgetCtx?.hasUI) return;
+
+  if (runningDispatchRuns.size === 0) {
+    latestWidgetCtx.ui.setWidget("cli-subagent-status", undefined);
+    if (dispatchWidgetInterval) {
+      clearInterval(dispatchWidgetInterval);
+      dispatchWidgetInterval = null;
+    }
+    return;
+  }
+
+  latestWidgetCtx.ui.setWidget(
+    "cli-subagent-status",
+    () => ({
+      invalidate() {},
+      render(width: number) {
+        return buildDispatchWidgetLines(
+          Array.from(runningDispatchRuns.values()).map((run) => ({
+            runtime: { name: run.state.runtime.name },
+            task: { label: run.state.task.label },
+            startedAt: run.state.startedAt,
+          })),
+          width,
+          Date.now()
+        );
+      },
+    }),
+    { placement: "aboveEditor" }
+  );
+}
+
+function startDispatchWidgetRefresh() {
+  if (dispatchWidgetInterval) return;
+  updateDispatchWidget();
+  dispatchWidgetInterval = setInterval(() => {
+    updateDispatchWidget();
+  }, 1000);
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1166,10 +1248,13 @@ function monitorDispatchedRun(
     promise,
     abortController,
   });
+  startDispatchWidgetRefresh();
+  updateDispatchWidget();
 
   promise
     .then((result) => {
       runningDispatchRuns.delete(state.runId);
+      updateDispatchWidget();
       const sendMessage = (pi as ExtensionAPI & { sendMessage?: Function }).sendMessage;
       sendMessage?.(
         {
@@ -1187,6 +1272,7 @@ function monitorDispatchedRun(
     })
     .catch((error) => {
       runningDispatchRuns.delete(state.runId);
+      updateDispatchWidget();
       const sendMessage = (pi as ExtensionAPI & { sendMessage?: Function }).sendMessage;
       sendMessage?.(
         {
@@ -1261,7 +1347,16 @@ async function startDispatchedTask(input: {
 
 export default function (pi: ExtensionAPI) {
   const piWithEvents = pi as ExtensionAPI & { on?: Function };
+  piWithEvents.on?.("session_start", (_event: unknown, ctx: unknown) => {
+    latestWidgetCtx = ctx;
+    updateDispatchWidget();
+  });
   piWithEvents.on?.("session_shutdown", () => {
+    if (dispatchWidgetInterval) {
+      clearInterval(dispatchWidgetInterval);
+      dispatchWidgetInterval = null;
+    }
+    latestWidgetCtx = null;
     for (const run of runningDispatchRuns.values()) {
       run.abortController.abort();
     }

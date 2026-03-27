@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import registerCliSubagent, { parseHandoffTimeoutMs } from "./index";
+import registerCliSubagent, { buildDispatchWidgetLines, parseHandoffTimeoutMs } from "./index";
 
 const tempDirs: string[] = [];
 const originalCmuxEnv = {
@@ -103,6 +103,46 @@ describe("parseHandoffTimeoutMs", () => {
   it("accepts positive millisecond values when explicitly configured", () => {
     expect(parseHandoffTimeoutMs("1800")).toBe(1800);
     expect(parseHandoffTimeoutMs("60000")).toBe(60000);
+  });
+});
+
+describe("buildDispatchWidgetLines", () => {
+  it("renders a bordered running-runs widget with elapsed time and runtime labels", () => {
+    const lines = buildDispatchWidgetLines(
+      [
+        {
+          runId: "run-1",
+          runtime: { name: "codex" },
+          task: { label: "Blueprint rebuild full implementation" },
+          startedAt: 1_000,
+        },
+      ],
+      80,
+      66_000
+    );
+
+    expect(lines[0]).toContain("CLI Subagents");
+    expect(lines[0]).toContain("1 running");
+    expect(lines[1]).toContain("01:05");
+    expect(lines[1]).toContain("codex");
+    expect(lines[1]).toContain("Blueprint rebuild full implementation");
+    expect(lines.at(-1)).toContain("╰");
+  });
+
+  it("shows overflow summary when more than three background runs exist", () => {
+    const lines = buildDispatchWidgetLines(
+      [
+        { runId: "1", runtime: { name: "codex" }, task: { label: "one" }, startedAt: 0 },
+        { runId: "2", runtime: { name: "gemini" }, task: { label: "two" }, startedAt: 0 },
+        { runId: "3", runtime: { name: "codex" }, task: { label: "three" }, startedAt: 0 },
+        { runId: "4", runtime: { name: "codex" }, task: { label: "four" }, startedAt: 0 },
+      ],
+      60,
+      5_000
+    );
+
+    expect(lines.join("\n")).toContain("4 running");
+    expect(lines.join("\n")).toContain("+1 more");
   });
 });
 

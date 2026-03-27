@@ -11,6 +11,7 @@ Launch Codex or Gemini inside `cmux`, keep the delegated session visible and ste
 - treats missing handoff as an explicit error once the delegated runtime exits instead of inventing completion
 - supports bounded parallel delegated runs through a `tasks` array
 - supports `mode: "wait" | "dispatch"` so long-running runs can continue in the background and steer results back later
+- shows a live widget above the editor while background dispatch runs are active
 - provides `cli_subagent_resume` to recover the final result for a dispatched run by `runId`
 - closes successful sessions by default and closes failed/timed-out sessions by default unless `retainOnError: true`
 - keeps local path details out of returned metadata by default; opt in with `PI_CLI_SUBAGENT_INCLUDE_DEBUG_PATHS=1`
