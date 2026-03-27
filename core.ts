@@ -383,24 +383,30 @@ export function selectProfile(
 
 export function buildDelegationPrompt(input: DelegationPromptInput): string {
   const reviewOnly = isReviewOnlyTask(input.task);
-  const deliveryLoop = reviewOnly
+  const architectWorkflow = reviewOnly
     ? [
-        "- Review the task and context.",
-        "- Break the work down.",
-        "- Analyze directly or via helper agents.",
-        "- Send the result for fresh review.",
-        "- Refine findings if the review surfaces gaps or ambiguity.",
-        "- Repeat inspect -> verify -> refine findings until the result is solid or you hit a real blocker.",
-        "- Do not self-certify casually. Use review plus verification before handoff.",
+        "Architect workflow (follow exactly):",
+        "- You are the architect for this task.",
+        "- Review the task and context first.",
+        "- Make a short plan before changing anything.",
+        "- Break the work into tracks.",
+        "- Use runtime-native helper agents/subsessions for investigation and review whenever available.",
+        "- Keep scope tight. No unrelated cleanup or refactors.",
+        "- Refine findings and re-review until the result is solid or blocked.",
+        "- Do not self-certify casually. Use fresh review plus verification before handoff.",
       ]
     : [
-        "- Review the task and context.",
-        "- Break the work down.",
-        "- Implement directly or via helper agents.",
-        "- Send the result for fresh review.",
-        "- Fix review findings.",
-        "- Repeat review -> fix -> re-review -> verify until the result is green or you hit a real blocker.",
-        "- Do not self-certify casually. Use review plus verification before handoff.",
+        "Architect workflow (follow exactly):",
+        "- You are the architect for this task.",
+        "- Review the task and context first.",
+        "- Make a short plan before changing anything.",
+        "- Break the work into tracks.",
+        "- Use runtime-native helper agents/subsessions for implementation whenever available.",
+        "- Do not jump straight into solo implementation if delegation is available.",
+        "- After implementation, launch fresh helper agents/subsessions for review.",
+        "- Fix issues they find and re-review until green or blocked.",
+        "- Keep scope tight. No unrelated cleanup or refactors.",
+        "- Do not self-certify casually. Use fresh review plus verification before handoff.",
       ];
 
   return [
@@ -411,15 +417,7 @@ export function buildDelegationPrompt(input: DelegationPromptInput): string {
     `Read this skill file now so you understand the handoff contract: ${input.skillFile}`,
     "You may use runtime-native helper agents/subsessions, built-in planning flows, and native review workflows in addition to that helper.",
     "",
-    "Operating mode:",
-    "- Act as the main architect for this delegated task.",
-    "- Read relevant context first, then make a short plan before changing anything.",
-    "- Break the work into smaller tasks or tracks.",
-    "- Use runtime-native helper agents/subsessions when available for non-trivial subtasks or parallel tracks.",
-    "- Keep scope tight. Do not drift into unrelated cleanup or refactors unless explicitly required.",
-    "",
-    "Delivery loop:",
-    ...deliveryLoop,
+    ...architectWorkflow,
     "",
     "Blocker mode:",
     "- If blocked or missing information, finish what you can and hand back clear blocker notes, evidence, what you tried, options, and your recommendation.",

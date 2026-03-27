@@ -79,7 +79,7 @@ describe("loadProfilesFromDir", () => {
 });
 
 describe("buildDelegationPrompt", () => {
-  it("injects the task, handoff contract, and manager-mode review loop", () => {
+  it("injects the task, handoff contract, and architect-first delegation workflow", () => {
     const prompt = buildDelegationPrompt({
       profile: sampleProfile("codex"),
       task: "Audit the auth module and report weak spots.",
@@ -92,16 +92,20 @@ describe("buildDelegationPrompt", () => {
     expect(prompt).toContain("/tmp/test-user/.agents/skills/codex-subagentdone/SKILL.md");
     expect(prompt).toContain("/tmp/run/handoff.md");
     expect(prompt).toContain("The only mandatory Pi-specific helper is codex-subagentdone for final handoff.");
-    expect(prompt).toContain("Act as the main architect for this delegated task.");
-    expect(prompt).toContain("Use runtime-native helper agents/subsessions when available for non-trivial subtasks or parallel tracks.");
-    expect(prompt).toContain("review -> fix -> re-review -> verify");
+    expect(prompt).toContain("Architect workflow (follow exactly):");
+    expect(prompt).toContain("You are the architect for this task.");
+    expect(prompt).toContain("Use runtime-native helper agents/subsessions for implementation whenever available.");
+    expect(prompt).toContain("Do not jump straight into solo implementation if delegation is available.");
+    expect(prompt).toContain("After implementation, launch fresh helper agents/subsessions for review.");
+    expect(prompt).toContain("Fix issues they find and re-review until green or blocked.");
     expect(prompt).toContain("If blocked or missing information, finish what you can and hand back clear blocker notes");
     expect(prompt).toContain("subagent_done --status success");
     expect(prompt).toContain("subagent_done --status error");
     expect(prompt).toContain("Be useful and concise.");
+    expect(prompt).not.toContain("Implement directly or via helper agents.");
   });
 
-  it("uses a review-only delivery loop when the task forbids edits", () => {
+  it("uses an architect review workflow when the task forbids edits", () => {
     const prompt = buildDelegationPrompt({
       profile: sampleProfile("codex"),
       task: "Review the auth flow. Read-only only. Do not modify files.",
@@ -110,9 +114,9 @@ describe("buildDelegationPrompt", () => {
       doneCommand: "subagent_done",
     });
 
-    expect(prompt).toContain("Analyze directly or via helper agents.");
-    expect(prompt).not.toContain("Implement directly or via helper agents.");
-    expect(prompt).toContain("Repeat inspect -> verify -> refine findings");
+    expect(prompt).toContain("Use runtime-native helper agents/subsessions for investigation and review whenever available.");
+    expect(prompt).not.toContain("Use runtime-native helper agents/subsessions for implementation whenever available.");
+    expect(prompt).toContain("Refine findings and re-review until the result is solid or blocked.");
   });
 });
 
